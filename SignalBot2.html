@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Trading Signal Bot</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #0d0d0d;
+      color: white;
+      text-align: center;
+    }
+    .container {
+      max-width: 600px;
+      margin: auto;
+      padding: 20px;
+      background: #1a1a1a;
+      border-radius: 15px;
+      box-shadow: 0 0 20px rgba(0,0,0,0.5);
+    }
+    h1 { color: #00eaff; }
+    label { display: block; margin-top: 10px; }
+    select, input {
+      width: 100%;
+      padding: 10px;
+      margin-top: 5px;
+      border-radius: 8px;
+      border: none;
+    }
+    button {
+      margin: 10px;
+      padding: 15px;
+      font-size: 16px;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: 0.3s;
+    }
+    #capture-btn { background: #00c3ff; color: black; }
+    #start-btn { background: #8f4dff; color: white; }
+    #stop-btn { background: #ff3d3d; color: white; }
+    #unlock-btn { background: #00ff66; color: black; display: none; }
+    #signal-type.buy { color: #00ff99; }
+    #signal-type.sell { color: #ff4444; }
+    #signal-type.hold { color: #999; }
+    .confidence-bar {
+      width: 100%;
+      background: #333;
+      border-radius: 10px;
+      margin-top: 10px;
+      height: 25px;
+      position: relative;
+    }
+    .confidence-fill {
+      height: 100%;
+      border-radius: 10px;
+      background: #00eaff;
+      text-align: center;
+      line-height: 25px;
+      font-size: 14px;
+      color: black;
+    }
+    table {
+      width: 100%;
+      margin-top: 20px;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    table, th, td {
+      border: 1px solid #444;
+    }
+    th, td {
+      padding: 8px;
+      text-align: center;
+    }
+    th {
+      background: #222;
+      color: #00eaff;
+    }
+    tr:nth-child(even) { background: #2a2a2a; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Trading Signal Bot</h1>
+
+    <label>Timeframe</label>
+    <select id="timeframe">
+      <option value="1m">1m</option>
+      <option value="5m">5m</option>
+      <option value="15m" selected>15m</option>
+      <option value="1h">1h</option>
+      <option value="4h">4h</option>
+    </select>
+
+    <label>Risk Level</label>
+    <select id="risk-level">
+      <option value="conservative">Conservative</option>
+      <option value="moderate" selected>Moderate</option>
+      <option value="aggressive">Aggressive</option>
+    </select>
+
+    <label>TP Multiplier</label>
+    <input type="number" id="tp-multiplier" value="2" step="0.1">
+
+    <label>Symbol/Pair</label>
+    <input type="text" id="symbol" value="ASTERUSDT">
+
+    <button id="capture-btn" onclick="analyzeChart()">📸 CAPTURE SCREEN</button>
+    <button id="start-btn" onclick="startBot()">▶ START ANALYSIS</button>
+    <button id="stop-btn" onclick="stopBot()">■ STOP BOT</button>
+    <button id="unlock-btn" onclick="unlockSignal()">🔓 UNLOCK SIGNAL</button>
+
+    <h2 id="signal-type" class="hold">HOLD</h2>
+    <p>Entry: <span id="entry-price">-</span></p>
+    <p>TP: <span id="tp-price">-</span></p>
+    <p>SL: <span id="sl-price">-</span></p>
+    <p>RR: <span id="risk-reward">-</span></p>
+    <p>Signals Generated: <span id="signal-count">0</span></p>
+    <p>Status: <span id="status">STOPPED</span></p>
+
+    <div class="confidence-bar">
+      <div class="confidence-fill" id="confidence-fill">0%</div>
+    </div>
+    <p id="confidence-text">0%</p>
+
+    <audio id="alert-sound" src="https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg" preload="auto"></audio>
+
+    <h2>📑 Trade Log</h2>
+    <table id="trade-log">
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Symbol</th>
+          <th>Signal</th>
+          <th>Entry</th>
+          <th>TP</th>
+          <th>SL</th>
+          <th>RR</th>
+          <th>Confidence</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+<script>
+let isRunning = false;
+let signalCount = 0;
+let analysisInterval = null;
+let signalLocked = false;
+
+// --- Binance Only Fetch ---
+async function fetchCandles(symbol, interval, limit = 200) {
+  try {
+    const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!Array.isArray(data)) throw new Error("Invalid Binance response");
+    return data.map(c => ({
+      time: c[0],
+      open: parseFloat(c[1]),
+      high: parseFloat(c[2]),
+      low: parseFloat(c[3]),
+      close: parseFloat(c[4]),
+      volume: parseFloat(c[5])
+    }));
+  } catch (err) {
+    alert("Capture failed: unable to fetch candle data from Binance.");
+    console.error("API error:", err);
+    return [];
+  }
+}
+
+// --- Indicators ---
+function SMA(data, period, field="close") {
+  return data.map((_, i) => {
+    if (i < period) return null;
+    let slice = data.slice(i-period, i);
+    return slice.reduce((a, b) => a + b[field], 0) / period;
+  });
+}
+function ATR(data, period=14) {
+  let tr = [];
+  for (let i = 1; i < data.length; i++) {
+    let high = data[i].high, low = data[i].low, prevClose = data[i-1].close;
+    tr.push(Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose)));
+  }
+  return tr.map((_, i) => i<period ? null : tr.slice(i-period, i).reduce((a,b)=>a+b,0)/period);
+}
+
+// --- Strategies ---
+function analyzeStrategies(data) {
+  let signals = [];
+  let closes = data.map(c=>c.close);
+  let lastClose = closes[closes.length-1];
+
+  // Trend: SMA50 vs SMA200
+  let sma50 = SMA(data, 50), sma200 = SMA(data, 200);
+  if (sma50[sma50.length-1] && sma200[sma200.length-1]) {
+    signals.push(sma50[sma50.length-1] > sma200[sma200.length-1] ? "BUY":"SELL");
+  }
+
+  // RSI
+  let gains=[],losses=[];
+  for(let i=1;i<closes.length;i++){
+    let diff=closes[i]-closes[i-1];
+    if(diff>=0) gains.push(diff); else losses.push(Math.abs(diff));
+  }
+  let avgGain=gains.reduce((a,b)=>a+b,0)/(gains.length||1);
+  let avgLoss=losses.reduce((a,b)=>a+b,0)/(losses.length||1);
+  let rsi=100-(100/(1+(avgGain/avgLoss)));
+  if(rsi<30) signals.push("BUY"); else if(rsi>70) signals.push("SELL");
+
+  // Breakout
+  let lastHigh=data[data.length-2].high, lastLow=data[data.length-2].low;
+  if(lastClose>lastHigh) signals.push("BUY");
+  else if(lastClose<lastLow) signals.push("SELL");
+
+  // Retracement: SMA20
+  let sma20=SMA(data,20);
+  if(sma20[sma20.length-1]) {
+    signals.push(lastClose>sma20[sma20.length-1]?"BUY":"SELL");
+  }
+
+  // Scalping momentum
+  let recent=closes.slice(-5);
+  let momentum=recent[4]-recent[0];
+  if(momentum>0) signals.push("BUY");
+  else if(momentum<0) signals.push("SELL");
+
+  // Liquidity: volume spike
+  let avgVol=data.slice(-20).reduce((a,b)=>a+b.volume,0)/20;
+  let lastVol=data[data.length-1].volume;
+  if(lastVol>1.5*avgVol) signals.push(lastClose>data[data.length-2].close?"BUY":"SELL");
+
+  // Price Action: engulfing
+  let prev=data[data.length-2], curr=data[data.length-1];
+  if(curr.open<curr.close && prev.open>prev.close && curr.close>prev.open) signals.push("BUY");
+  else if(curr.open>curr.close && prev.open<prev.close && curr.close<prev.open) signals.push("SELL");
+
+  return signals;
+}
+
+// --- Signal Generator ---
+function generateSignal(data,riskLevel,tpMultiplier){
+  let strategies=analyzeStrategies(data);
+  let buyVotes=strategies.filter(s=>"BUY"===s).length;
+  let sellVotes=strategies.filter(s=>"SELL"===s).length;
+
+  let signal="HOLD";
+  if(buyVotes>=3&&buyVotes>sellVotes) signal="BUY";
+  else if(sellVotes>=3&&sellVotes>buyVotes) signal="SELL";
+
+  let lastClose=data[data.length-1].close;
+  let atr=ATR(data); let atrValue=atr[atr.length-1]||(lastClose*0.01);
+
+  let riskFactor = riskLevel==="conservative"?0.5:riskLevel==="moderate"?1:riskLevel==="aggressive"?1.5:1;
+  let slDistance=atrValue*riskFactor;
+  let tp,sl;
+  if(signal==="BUY"){sl=lastClose-slDistance;tp=lastClose+(slDistance*tpMultiplier);}
+  else if(signal==="SELL"){sl=lastClose+slDistance;tp=lastClose-(slDistance*tpMultiplier);}
+  else {tp=sl=lastClose;}
+
+  let confidence=Math.min(95,(Math.max(buyVotes,sellVotes)/strategies.length)*100);
+  return {signal,entry:lastClose,tp,sl,confidence,rr:tpMultiplier};
+}
+
+// --- Analysis Runner ---
+async function analyzeChart(){
+  if(!isRunning || signalLocked) return;
+  let tf=document.getElementById("timeframe").value;
+  let risk=document.getElementById("risk-level").value;
+  let tpMult=parseFloat(document.getElementById("tp-multiplier").value);
+  let symbol=document.getElementById("symbol").value.toUpperCase();
+
+  let candles=await fetchCandles(symbol,tf,200);
+  if(!candles.length) return;
+
+  let sig=generateSignal(candles,risk,tpMult);
+
+  let signalType=document.getElementById("signal-type");
+  signalType.textContent=sig.signal;
+  signalType.className=`${sig.signal.toLowerCase()}`;
+
+  document.getElementById("entry-price").textContent=sig.entry.toFixed(5);
+  document.getElementById("tp-price").textContent=sig.tp.toFixed(5);
+  document.getElementById("sl-price").textContent=sig.sl.toFixed(5);
+  document.getElementById("risk-reward").textContent=`1:${sig.rr}`;
+  document.getElementById("confidence-text").textContent=`${sig.confidence.toFixed(1)}%`;
+  document.getElementById("confidence-fill").style.width=`${sig.confidence}%`;
+  document.getElementById("confidence-fill").textContent=`${sig.confidence.toFixed(1)}%`;
+
+  if(sig.signal!=="HOLD"){
+    signalCount++;
+    document.getElementById("signal-count").textContent=signalCount;
+    logTrade(symbol,sig);
+    if(sig.confidence>=70){ lockSignal(); triggerAlert(sig.signal,sig.confidence); }
+  }
+}
+
+// --- Alerts & Logs ---
+function triggerAlert(signal,confidence){
+  let audio=document.getElementById("alert-sound");
+  audio.play();
+  alert(`🚨 STRONG ${signal} SIGNAL DETECTED!\nConfidence: ${confidence.toFixed(1)}%`);
+}
+function lockSignal(){
+  signalLocked=true;
+  document.getElementById("unlock-btn").style.display="inline-block";
+  document.getElementById("status").textContent="LOCKED - Awaiting User Input";
+}
+function unlockSignal(){
+  signalLocked=false;
+  document.getElementById("unlock-btn").style.display="none";
+  document.getElementById("status").textContent="RUNNING";
+}
+function logTrade(symbol,sig){
+  let log=document.getElementById("trade-log").querySelector("tbody");
+  let row=document.createElement("tr");
+  let now=new Date().toLocaleString();
+  row.innerHTML=`
+    <td>${now}</td>
+    <td>${symbol}</td>
+    <td>${sig.signal}</td>
+    <td>${sig.entry.toFixed(5)}</td>
+    <td>${sig.tp.toFixed(5)}</td>
+    <td>${sig.sl.toFixed(5)}</td>
+    <td>1:${sig.rr}</td>
+    <td>${sig.confidence.toFixed(1)}%</td>
+  `;
+  log.prepend(row);
+}
+
+// --- Bot Control ---
+function startBot(){isRunning=true;document.getElementById("status").textContent="RUNNING";analysisInterval=setInterval(analyzeChart,10000);analyzeChart();}
+function stopBot(){isRunning=false;signalLocked=false;document.getElementById("status").textContent="STOPPED";clearInterval(analysisInterval);}
+</script>
+</body>
+</html>
